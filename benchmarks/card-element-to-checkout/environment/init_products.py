@@ -12,6 +12,7 @@ Usage:
 import os
 import sqlite3
 import stripe
+import asyncio
 
 # Configuration
 STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
@@ -190,7 +191,7 @@ def migrate_to_stripe(products, discounts):
     stripe_coupons = {}
     stripe_promos = {}
 
-    for discount in discounts:
+    async def create_discount_async(discount):
         code = discount["code"]
 
         # Create coupon
@@ -206,18 +207,26 @@ def migrate_to_stripe(products, discounts):
             coupon_params["currency"] = "usd"
             desc = f"${discount['amount_off']/100:.2f} off"
 
-        coupon = stripe.Coupon.create(**coupon_params)
-        stripe_coupons[code] = coupon.id
+        coupon = await stripe.Coupon.create_async(**coupon_params)
         print(f"Created coupon: {code} ({desc})")
         print(f"  Coupon ID: {coupon.id}")
 
         # Create promotion code
-        promo = stripe.PromotionCode.create(
+        promo = await stripe.PromotionCode.create_async(
             promotion={"type": "coupon", "coupon": coupon.id},
         )
-        stripe_promos[code] = promo.id
         print(f"  Promo Code ID: {promo.id}")
         print()
+        return code, coupon.id, promo.id
+
+    async def create_all_discounts(discounts):
+        tasks = [create_discount_async(d) for d in discounts]
+        return await asyncio.gather(*tasks)
+
+    results = asyncio.run(create_all_discounts(discounts))
+    for code, coupon_id, promo_id in results:
+        stripe_coupons[code] = coupon_id
+        stripe_promos[code] = promo_id
 
     # Update database with Stripe IDs
     update_stripe_ids("discounts", "code", "stripe_coupon_id", stripe_coupons)
