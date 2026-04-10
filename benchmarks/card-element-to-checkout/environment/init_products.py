@@ -9,6 +9,7 @@ Usage:
     STRIPE_SECRET_KEY=sk_test_xxx python init_products.py
 """
 
+import asyncio
 import os
 import sqlite3
 import stripe
@@ -18,28 +19,22 @@ STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY")
 DB_PATH = "environment/server/db.sqlite3"
 
 DISCOUNTS = {
-    "SAVE20":{
+    "SAVE20": {
         "key": "percent_off",
         "value": 20.0,
     },
-    "SAVE10":{
+    "SAVE10": {
         "key": "percent_off",
         "value": 10.0,
     },
-    "5OFF":{
+    "5OFF": {
         "key": "amount_off",
         "value": 500,
-    }
+    },
 }
 PRODUCTS = [
-    {
-        "name": "Asparagus",
-        "price": 899
-    },
-    {
-        "name": "Ethiopean coffee beans",
-        "price": 1899
-    }
+    {"name": "Asparagus", "price": 899},
+    {"name": "Ethiopean coffee beans", "price": 1899},
 ]
 
 
@@ -58,15 +53,17 @@ def load_products_from_db():
 
     products = []
     for row in cursor.fetchall():
-        products.append({
-            "local_id": row[0],
-            "name": row[1],
-            "description": row[2],
-            "image_url": row[3],
-            "local_price_id": row[4],
-            "price": row[5],
-            "currency": row[6],
-        })
+        products.append(
+            {
+                "local_id": row[0],
+                "name": row[1],
+                "description": row[2],
+                "image_url": row[3],
+                "local_price_id": row[4],
+                "price": row[5],
+                "currency": row[6],
+            }
+        )
 
     conn.close()
     return products
@@ -81,11 +78,13 @@ def load_discounts_from_db():
 
     discounts = []
     for row in cursor.fetchall():
-        discounts.append({
-            "code": row[0],
-            "amount_off": row[1],
-            "percent_off": row[2],
-        })
+        discounts.append(
+            {
+                "code": row[0],
+                "amount_off": row[1],
+                "percent_off": row[2],
+            }
+        )
 
     conn.close()
     return discounts
@@ -135,108 +134,150 @@ def update_stripe_ids(table, id_column, stripe_column, mapping):
     for local_id, stripe_id in mapping.items():
         cursor.execute(
             f"UPDATE {table} SET {stripe_column} = ? WHERE {id_column} = ?",
-            (stripe_id, local_id)
+            (stripe_id, local_id),
         )
 
     conn.commit()
     conn.close()
 
 
-def migrate_to_stripe(products, discounts):
-    """Create Stripe products, prices, coupons, and promotion codes."""
+async def process_product(product):
+    log_messages = []
+    stripe_product = await stripe.Product.create_async(
+        name=product["name"],
+        description=product["description"] or "",
+        images=[product["image_url"]] if product["image_url"] else [],
+    )
+    log_messages.append(f"Created: {product['name']}")
+    log_messages.append(f"  Stripe ID: {stripe_product.id}")
+
+    stripe_price = await stripe.Price.create_async(
+        product=stripe_product.id,
+        unit_amount=product["price"],
+        currency=product["currency"],
+    )
+    price_val = product["price"] / 100
+    log_messages.append(f"  Price: ${price_val:.2f} -> {stripe_price.id}")
+    return (
+        product["local_id"],
+        stripe_product.id,
+        product["local_price_id"],
+        stripe_price.id,
+        log_messages,
+    )
+
+
+async def process_discount(discount):
+    log_messages = []
+    code = discount["code"]
+
+    coupon_params = {
+        "name": code,
+        "duration": "once",
+    }
+    if discount["percent_off"]:
+        coupon_params["percent_off"] = discount["percent_off"]
+        desc = f"{discount['percent_off']}% off"
+    else:
+        coupon_params["amount_off"] = discount["amount_off"]
+        coupon_params["currency"] = "usd"
+        amount_val = discount["amount_off"] / 100
+        desc = f"${amount_val:.2f} off"
+
+    coupon = await stripe.Coupon.create_async(**coupon_params)
+    log_messages.append(f"Created coupon: {code} ({desc})")
+    log_messages.append(f"  Coupon ID: {coupon.id}")
+
+    promo = await stripe.PromotionCode.create_async(
+        promotion={"type": "coupon", "coupon": coupon.id},
+    )
+    log_messages.append(f"  Promo Code ID: {promo.id}")
+    return code, coupon.id, promo.id, log_messages
+
+
+async def async_migrate_to_stripe(products, discounts):
     if not STRIPE_SECRET_KEY:
         print("ERROR: STRIPE_SECRET_KEY environment variable not set")
         return
 
     stripe.api_key = STRIPE_SECRET_KEY
 
-    print("=== Adding Stripe ID columns to database ===\n")
+    print("=== Adding Stripe ID columns to database ===")
+    print("")
     add_stripe_columns()
 
-    print("\n=== Migrating Products to Stripe ===\n")
+    print("")
+    print("=== Migrating Products to Stripe ===")
+    print("")
 
     stripe_products = {}
     stripe_prices = {}
 
-    for product in products:
-        # Check if product already exists by name
-        stripe_product = stripe.Product.create(
-            name=product["name"],
-            description=product["description"] or "",
-            images=[product["image_url"]] if product["image_url"] else [],
-        )
-        print(f"Created: {product['name']}")
-        print(f"  Stripe ID: {stripe_product.id}")
+    product_tasks = [process_product(p) for p in products]
+    product_results = await asyncio.gather(*product_tasks)
 
-        stripe_products[product["local_id"]] = stripe_product.id
-
-        # Create a new price
-        stripe_price = stripe.Price.create(
-            product=stripe_product.id,
-            unit_amount=product["price"],
-            currency=product["currency"],
-        )
-        stripe_prices[product["local_price_id"]] = stripe_price.id
-        print(f"  Price: ${product['price']/100:.2f} -> {stripe_price.id}")
-        print()
+    for (
+        local_id,
+        stripe_product_id,
+        local_price_id,
+        stripe_price_id,
+        logs,
+    ) in product_results:
+        stripe_products[local_id] = stripe_product_id
+        stripe_prices[local_price_id] = stripe_price_id
+        for msg in logs:
+            print(msg)
+        print("")
 
     # Update database with Stripe IDs
     update_stripe_ids("inventory", "id", "stripe_product_id", stripe_products)
     update_stripe_ids("costs", "id", "stripe_price_id", stripe_prices)
-    print("Updated database with Stripe product and price IDs\n")
+    print("Updated database with Stripe product and price IDs")
+    print("")
 
-    print("=== Migrating Discounts to Stripe ===\n")
+    print("=== Migrating Discounts to Stripe ===")
+    print("")
 
     stripe_coupons = {}
     stripe_promos = {}
 
-    for discount in discounts:
-        code = discount["code"]
+    discount_tasks = [process_discount(d) for d in discounts]
+    discount_results = await asyncio.gather(*discount_tasks)
 
-        # Create coupon
-        coupon_params = {
-            "name": code,
-            "duration": "once",
-        }
-        if discount["percent_off"]:
-            coupon_params["percent_off"] = discount["percent_off"]
-            desc = f"{discount['percent_off']}% off"
-        else:
-            coupon_params["amount_off"] = discount["amount_off"]
-            coupon_params["currency"] = "usd"
-            desc = f"${discount['amount_off']/100:.2f} off"
-
-        coupon = stripe.Coupon.create(**coupon_params)
-        stripe_coupons[code] = coupon.id
-        print(f"Created coupon: {code} ({desc})")
-        print(f"  Coupon ID: {coupon.id}")
-
-        # Create promotion code
-        promo = stripe.PromotionCode.create(
-            promotion={"type": "coupon", "coupon": coupon.id},
-        )
-        stripe_promos[code] = promo.id
-        print(f"  Promo Code ID: {promo.id}")
-        print()
+    for code, coupon_id, promo_id, logs in discount_results:
+        stripe_coupons[code] = coupon_id
+        stripe_promos[code] = promo_id
+        for msg in logs:
+            print(msg)
+        print("")
 
     # Update database with Stripe IDs
     update_stripe_ids("discounts", "code", "stripe_coupon_id", stripe_coupons)
     update_stripe_ids("discounts", "code", "stripe_promo_id", stripe_promos)
-    print("Updated database with Stripe coupon and promo IDs\n")
+    print("Updated database with Stripe coupon and promo IDs")
+    print("")
 
     # Print summary
-    print("=== Migration Summary ===\n")
+    print("=== Migration Summary ===")
+    print("")
     print("Products:")
     for local_id, stripe_id in stripe_products.items():
         print(f"  {local_id} -> {stripe_id}")
 
-    print("\nPrices:")
+    print("")
+    print("Prices:")
     for local_id, stripe_id in stripe_prices.items():
         print(f"  {local_id} -> {stripe_id}")
 
-    print("\nPromotion Codes:")
+    print("")
+    print("Promotion Codes:")
     for code, promo_id in stripe_promos.items():
         print(f"  {code} -> {promo_id}")
+
+
+def migrate_to_stripe(products, discounts):
+    """Create Stripe products, prices, coupons, and promotion codes."""
+    asyncio.run(async_migrate_to_stripe(products, discounts))
 
 
 def main():
@@ -249,14 +290,14 @@ def main():
 
     print(f"Found {len(products)} products:")
     for p in products:
-        print(f"  - {p['name']} @ ${p['price']/100:.2f}")
+        print(f"  - {p['name']} @ ${p['price'] / 100:.2f}")
 
     print(f"\nFound {len(discounts)} discounts:")
     for d in discounts:
         if d["percent_off"]:
             print(f"  - {d['code']}: {d['percent_off']}% off")
         else:
-            print(f"  - {d['code']}: ${d['amount_off']/100:.2f} off")
+            print(f"  - {d['code']}: ${d['amount_off'] / 100:.2f} off")
 
     print()
 
